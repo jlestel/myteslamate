@@ -96,6 +96,86 @@ defmodule Util do
   def get_env(varname, defaults \\ []) do
     System.get_env(varname, defaults[config_env()])
   end
+
+  def external_binding?() do
+    http_binding = System.get_env("HTTP_BINDING_ADDRESS", "")
+    http_binding == "" or http_binding == "0.0.0.0" or http_binding == "::1"
+  end
+
+  def tls_enabled?() do
+    # Force TLS for external access (empty, 0.0.0.0, or ::1 bindings)
+    case System.get_env("DISABLE_TLS", "false") do
+      "true" ->
+        if not external_binding?() do
+          false
+        else
+          true
+        end
+
+      _ ->
+        true
+    end
+  end
+
+  def tls_config() do
+    if tls_enabled?() do
+      cert_file = System.get_env("TLS_CERT_FILE", "priv/cert/selfsigned.pem")
+      key_file = System.get_env("TLS_KEY_FILE", "priv/cert/selfsigned_key.pem")
+
+      # Create signed certs if they don't exist
+      ensure_self_signed_certs(cert_file, key_file)
+
+      [
+        port: System.get_env("HTTPS_PORT", "4001") |> String.to_integer(),
+        cipher_suite: :strong,
+        keyfile: key_file,
+        certfile: cert_file,
+        transport_options: [socket_opts: [:inet6]]
+      ]
+    else
+      nil
+    end
+  end
+
+  def ensure_self_signed_certs(cert_file, key_file) do
+    cert_dir = Path.dirname(cert_file)
+
+    unless File.exists?(cert_file) and File.exists?(key_file) do
+      File.mkdir_p!(cert_dir)
+
+      IO.puts("[info] Generating self-signed TLS certificate...")
+
+      # Generate a private key and a self-signed certificate
+      {_, 0} =
+        System.cmd(
+          "openssl",
+          [
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:4096",
+            "-keyout",
+            key_file,
+            "-out",
+            cert_file,
+            "-days",
+            "365",
+            "-nodes",
+            "-subj",
+            "/C=US/ST=State/L=City/O=TeslaMate/CN=localhost"
+          ],
+          stderr_to_stdout: true
+        )
+
+      IO.puts("[info] Self-signed TLS certificate generated at #{cert_file}")
+    end
+  end
+
+  def http_config() do
+    # Always enable HTTP, even if TLS is enabled
+    # Redirection will happen via force_ssl in the endpoint
+    choose_http_binding_address()
+  end
 end
 
 config :teslamate,
@@ -151,12 +231,17 @@ if System.get_env("DATABASE_IPV6") == "true" do
 end
 
 config :teslamate, TeslaMateWeb.Endpoint,
-  http: Util.choose_http_binding_address(),
+  http: Util.http_config(),
+  https: Util.tls_config(),
   url: [
     host: System.get_env("VIRTUAL_HOST", "localhost"),
     path: System.get_env("URL_PATH", "/"),
-    port: 80
+    port: if(Util.tls_enabled?(), do: 443, else: 80),
+    scheme: if(Util.tls_enabled?(), do: "https", else: "http")
   ],
+  force_ssl:
+    Util.tls_enabled?() and
+      (System.get_env("FORCE_HTTPS", "true") == "true" or Util.external_binding?()),
   secret_key_base: System.get_env("SECRET_KEY_BASE", Util.random_string(64)),
   live_view: [signing_salt: System.get_env("SIGNING_SALT", Util.random_string(8))],
   check_origin: System.get_env("CHECK_ORIGIN", "false") |> Util.parse_check_origin!()
